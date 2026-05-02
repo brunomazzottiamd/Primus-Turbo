@@ -209,7 +209,7 @@ class GroupedGEMMTritonBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ) -> torch.Tensor:
-        return grouped_gemm_triton_kernel(a, b, group_offs, trans_b=trans_b)
+        return grouped_gemm_triton_kernel(a, b, group_offs, trans_b=trans_b, grid_dim=num_cu)
 
 
 _GROUPED_GEMM_BACKENDS = {

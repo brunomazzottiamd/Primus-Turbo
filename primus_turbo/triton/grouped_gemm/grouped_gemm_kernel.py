@@ -235,6 +235,7 @@ def grouped_gemm_triton_kernel(
     b: torch.Tensor,
     group_offs: torch.Tensor,
     trans_b: bool = False,
+    grid_dim: Optional[int] = None,
 ) -> torch.Tensor:
     """Persistent grouped GEMM (CPU-sync-free) using Triton.
 
@@ -279,7 +280,7 @@ def grouped_gemm_triton_kernel(
     out = torch.empty((M_total, N), device=a.device, dtype=a.dtype)
 
     # Kernel config
-    num_sms = _get_num_cus()
+    num_sms = _get_num_cus() if grid_dim is None else grid_dim
     even_k = K % 64 == 0
     group_m = 4  # Default GROUP_SIZE_M for grouped GEMM
 
