@@ -256,7 +256,7 @@ class GroupedGEMMVariableKTritonBackend(KernelBackend):
             lhs, rhs = b, a
         else:
             lhs, rhs = a, b
-        return grouped_gemm_variable_k_triton_kernel(lhs, rhs, group_offs)
+        return grouped_gemm_variable_k_triton_kernel(lhs, rhs, group_offs, grid_dim=num_cu)
 
 
 _GROUPED_GEMM_VARIABLE_K_BACKENDS = {
