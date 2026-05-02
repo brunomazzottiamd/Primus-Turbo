@@ -595,6 +595,7 @@ def grouped_gemm_variable_k_triton_kernel(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
     group_offs: torch.Tensor,
+    grid_dim: Optional[int] = None,
 ) -> torch.Tensor:
     """Variable-K grouped BF16/FP16 GEMM (backward) using Triton.
 
@@ -616,7 +617,7 @@ def grouped_gemm_variable_k_triton_kernel(
     G = group_offs.shape[0] - 1
 
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=lhs.dtype)
-    num_sms = _get_num_cus()
+    num_sms = _get_num_cus() if grid_dim is None else grid_dim
     dummy_scale = torch.empty(1, device=lhs.device, dtype=torch.float32)
 
     if _is_gfx950():
