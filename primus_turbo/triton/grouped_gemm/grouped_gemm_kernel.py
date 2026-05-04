@@ -199,6 +199,7 @@ def _grouped_bf16_persistent_gemm_kernel(
     # Constexpr strides (for compiler optimisation)
     stride_ak: tl.constexpr,  # A K-stride (=1 when trans_a=False, contiguous)
     stride_bk: tl.constexpr,  # B K-stride (=1 when trans_b=True)
+    global_counter,
     # Tile config
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -240,7 +241,13 @@ def _grouped_bf16_persistent_gemm_kernel(
 
     acc_dtype = tl.float32
 
-    for global_tile_id in range(pid, total_tiles, NUM_SMS):
+    tiles_per_sm = total_tiles // NUM_SMS
+    if pid < total_tiles % NUM_SMS:
+        tiles_per_sm += 1
+
+    # for global_tile_id in range(pid, total_tiles, NUM_SMS):
+    for _ in range(0, tiles_per_sm):
+        global_tile_id = tl.atomic_add(global_counter, 1, sem="relaxed", scope='gpu')
         # ── Find group via linear scan (O(G)) ──
         group_idx: tl.int32 = 0
         tile_start: tl.int32 = 0
@@ -389,6 +396,8 @@ def grouped_gemm_triton_kernel(
     )
     even_k = K % BLOCK_K == 0
 
+    global_counter = torch.zeros((1,), dtype=torch.int32, device=a.device)
+
     _grouped_bf16_persistent_gemm_kernel[(num_sms,)](
         a,
         b,
@@ -404,6 +413,7 @@ def grouped_gemm_triton_kernel(
         out.stride(1),  # stride_cn
         stride_ak=stride_ak,
         stride_bk=stride_bk,
+        global_counter=global_counter,
         BLOCK_SIZE_M=BLOCK_M,
         BLOCK_SIZE_N=BLOCK_N,
         BLOCK_SIZE_K=BLOCK_K,
