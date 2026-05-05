@@ -241,13 +241,10 @@ def _grouped_bf16_persistent_gemm_kernel(
 
     acc_dtype = tl.float32
 
-    tiles_per_sm = total_tiles // NUM_SMS
-    if pid < total_tiles % NUM_SMS:
-        tiles_per_sm += 1
-
     # for global_tile_id in range(pid, total_tiles, NUM_SMS):
-    for _ in range(0, tiles_per_sm):
-        global_tile_id = tl.atomic_add(global_counter, 1, sem="relaxed", scope='gpu')
+    # global_tile_id = tl.atomic_add(global_counter, 1, sem="relaxed", scope='gpu')
+    global_tile_id = pid
+    while global_tile_id < total_tiles:
         # ── Find group via linear scan (O(G)) ──
         group_idx: tl.int32 = 0
         tile_start: tl.int32 = 0
@@ -336,6 +333,8 @@ def _grouped_bf16_persistent_gemm_kernel(
         C_ = C + m_start_g * stride_cm + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
         tl.store(C_, c, c_mask)
 
+        global_tile_id = tl.atomic_add(global_counter, 1, sem="relaxed", scope='gpu')
+
 
 def grouped_gemm_triton_kernel(
     a: torch.Tensor,
@@ -396,7 +395,7 @@ def grouped_gemm_triton_kernel(
     )
     even_k = K % BLOCK_K == 0
 
-    global_counter = torch.zeros((1,), dtype=torch.int32, device=a.device)
+    global_counter = torch.zeros((1,), dtype=torch.int32, device=a.device) + num_sms
 
     _grouped_bf16_persistent_gemm_kernel[(num_sms,)](
         a,
