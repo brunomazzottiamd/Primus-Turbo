@@ -97,7 +97,9 @@ NCCL_MAX_NCHANNELS=16 torchrun --nproc_per_node=8 bench_overlap.py \
   --ag-size-mb 512 --grid-dims 128,192,208,216,220,224,228,232,240,248,256
 ``` 
 
-We get the following perf numbers for the Triton backend:
+We get the following perf numbers for both the CK and Triton backend:
+
+### Triton performance numbers
 
 | GRID_DIM | GEMM only (ms) | Sequential (ms) | Overlap GEMM (ms) | Overlap wall (ms) | Slowdown (overlap/gemm) |
 |---:|---:|---:|---:|---:|---:|
@@ -113,14 +115,41 @@ We get the following perf numbers for the Triton backend:
 | 248 | 2.150 | 2.305 | 4.456 | 4.505 | 2.07× |
 | 256 | 2.150 | 2.275 | 4.365 | 4.413 | 2.03× |
 
+### CK Performance numbers:
+
+| GRID_DIM | GEMM only (ms) | Sequential (ms) | Overlap GEMM (ms) | Overlap wall (ms) | Slowdown (overlap/gemm) |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 2.664 | 2.998 | 3.019 | 3.068 | 1.13× |
+| 192 | 1.972 | 2.148 | 2.166 | 2.211 | 1.10× |
+| 208 | 1.926 | 1.997 | 2.067 | 2.115 | 1.07× |
+| 216 | 1.911 | 1.987 | 2.036 | 2.081 | 1.07× |
+| 220 | 1.905 | 1.988 | 2.010 | 2.057 | 1.06× |
+| 224 | 1.899 | 1.963 | 1.970 | 2.017 | 1.04× |
+| 228 | 1.894 | 1.941 | 3.808 | 3.854 | 2.01× |
+| 232 | 1.864 | 1.916 | 3.755 | 3.801 | 2.02× |
+| 240 | 1.835 | 1.874 | 3.692 | 3.737 | 2.01× |
+| 248 | 1.822 | 1.866 | 3.555 | 3.601 | 1.95× |
+| 256 | 1.778 | 1.807 | 3.452 | 3.499 | 1.94× |
+
 MI350 contains 256 CUs. With RCCL kernel using 16 CUs, when GroupGEMM use 240 or less CUs, there should be no performance
-degradation, but this table shows a big slowdown when groupGEMM uses 228 or more CUs.
+degradation, but this table shows a big slowdown when groupGEMM uses 228 or more CUs. Reason is due to the algorithm used to 
+dispatch workgroups to CU. From the ATT trace in the next section, we can see that for the case with 228 CUs for groupgemm,
+there are 13 CUs idle, at the same time, there are multiple works groups dispatched to the same CUs, which almost doubles
+the groupgemm kernel time. A second note is that the CK kernel is faster then the Triton, and we will try to optimize the
+Triton kernel.
+
+With a newer version of fw, we can move the cliff from 240CUs for groupgemm, see the following table:
+
+(add a table here for perf numbers)
 
 ## 4. ATT Trace Analysis
 
+ATT trace indicates that with RCCL using 16 CUs, there are 240 CUs availabe for groupgemm, but the firmware algorithm stills
+dispatches two workgroups to the same CUs, which doubles kernel time, and at the same time, there are 13CUs idle.
 
+(Add a picture for the ATT trace)
 
-## 5. Root cause
+## 5. Optimization
 
 The Triton Grouped GEMM kernel in its original form used a **static tile assignment**: each
 wave-front (CU) received a fixed subset of output tiles pre-determined at launch time via a
@@ -130,15 +159,54 @@ CUs stall waiting on memory while others finish early.  Because tiles are static
 early-finishing CUs sit idle while stalled CUs still hold work — the kernel cannot retire until
 the *slowest* CU finishes, so RCCL-induced memory pressure linearly inflates the GEMM latency.
 
-## 6. Fix: work stealing via a GPU-side atomic counter
+With the new firmware, we can configure at most 240 CUs to avoid the slowdown. But in the training scenario, there are also
+scenarios that there is no overlap with RCCL, and we want to configure 256 workgroups for groupGEMM to fully utilize all 
+hardware resources. We introduce the work stealing to dynamically run different tiles on CUs.
 
-Replacing the static stride loop with a **GPU-side atomic counter** (`tl.atomic_add`) converts
-tile assignment to fully dynamic work stealing.  CUs that finish their current tile immediately
-atomically claim the next available global tile.  Stalled CUs simply claim fewer tiles; fast CUs
-absorb the slack.  This decouples GEMM completion time from any single CU's memory latency,
-restoring near-baseline performance even under heavy RCCL traffic.
+### Work Stealing
 
-### After optimization
+Work stealing is a dynamic tile-scheduling strategy that eliminates the load-imbalance problem
+caused by RCCL memory pressure.
+
+**Static assignment (the problem).**  In the original kernel each CU is pre-assigned a fixed
+stripe of output tiles at launch time via a round-robin stride:
+
+```python
+for tile_id in range(pid, total_tiles, GRID_DIM):
+    compute(tile_id)
+```
+
+Every CU must finish its entire stripe before the kernel can retire.  Under concurrent RCCL
+traffic some CUs stall on HBM/interconnect latency; those CUs hold unfinished tiles while
+fast CUs sit idle.  The effective kernel time becomes `max(per-CU latency)`, so a single
+stalled CU stretches the whole kernel.
+
+**Work stealing (the fix).**  A single 64-bit counter (`tile_counter`) lives in global memory,
+initialised to zero.  Instead of striding through a pre-assigned range, each CU atomically
+increments the counter to claim the next available tile:
+
+```python
+while True:
+    tile_id = tl.atomic_add(tile_counter_ptr, 1)   # claim one tile
+    if tile_id >= total_tiles:
+        break
+    compute(tile_id)
+```
+
+CUs that finish quickly loop back and steal more tiles; CUs stalled by memory pressure
+naturally claim fewer.  The kernel retires as soon as the last tile is computed — no CU
+waits for another.
+
+**Why the overhead is small.**  Each `tl.atomic_add` touches one L2-cached cache line.  The
+operation is fast (~10–20 cycles) relative to a full tile computation (hundreds of cycles of
+matrix math), so the atomic is not a bottleneck even at 256 CUs all hammering the same
+counter simultaneously.
+
+**Boundary condition.**  The loop check `tile_id >= total_tiles` correctly handles the case
+where more CUs are launched than there are tiles: excess CUs exit immediately without doing
+any work.
+
+## 6. Performance numbers 
 
 With the work stealing optimization, we got the following performance numbers:
 
@@ -161,7 +229,6 @@ With the work stealing optimization, we got the following performance numbers:
 From the results, we can see that the biggest slowdown is 23% compared to running the GroupGEMM using all 256CUs.
 There are two factor invovlved when overlapping with RCCL, 16 fewer CUs are used for GroupGEMM and there is a 
 general 10% overhead.
-
 
 
 ### Why the improvement is large
