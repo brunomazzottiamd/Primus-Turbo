@@ -91,6 +91,7 @@ GEMM-only, and a CSV row for plotting.
 ## 3. Observed performance
 By running the CK kernel with different grim-dim values using the following command line:
 ```
+PRIMUS_TURBO_GROUPED_GEMM_BACKEND=TRITON \
 NCCL_MAX_NCHANNELS=16 torchrun --nproc_per_node=8 bench_overlap.py \
   --backend primus --trans-b \
   --G 32 --M 267424 --K 1280 --N 2560 \
@@ -101,7 +102,7 @@ We get the following perf numbers for both the CK and Triton backend:
 
 ### Triton performance numbers
 
-| GRID_DIM | GEMM only (ms) | Sequential (ms) | Overlap GEMM (ms) | Overlap wall (ms) | Slowdown (overlap/gemm) |
+| GRID_DIM | GroupedGEMM<br>only (ms) | Sequential<br>(ms) | Overlap<br>GroupedGEMM<br>(ms) | Overlap<br>wall (ms) | Slowdown<br>(overlap/<br>groupedgemm) |
 |---:|---:|---:|---:|---:|---:|
 | 128 | 3.603 | 3.811 | 3.863 | 3.914 | 1.07× |
 | 192 | 2.522 | 2.778 | 2.823 | 2.872 | 1.12× |
@@ -117,7 +118,9 @@ We get the following perf numbers for both the CK and Triton backend:
 
 ### CK Performance numbers:
 
-| GRID_DIM | GEMM only (ms) | Sequential (ms) | Overlap GEMM (ms) | Overlap wall (ms) | Slowdown (overlap/gemm) |
+remove the env var `PRIMUS_TURBO_GROUPED_GEMM_BACKEND=TRITON` from the command line, we got:
+
+| GRID_DIM | GroupedGEMM<br>only (ms) | Sequential<br>(ms) | Overlap<br>GroupedGEMM<br>(ms) | Overlap<br>wall (ms) | Slowdown<br>(overlap/<br>groupedgemm) |
 |---:|---:|---:|---:|---:|---:|
 | 128 | 2.664 | 2.998 | 3.019 | 3.068 | 1.13× |
 | 192 | 1.972 | 2.148 | 2.166 | 2.211 | 1.10× |
@@ -138,9 +141,24 @@ there are 13 CUs idle, at the same time, there are multiple works groups dispatc
 the groupgemm kernel time. A second note is that the CK kernel is faster then the Triton, and we will try to optimize the
 Triton kernel.
 
-With a newer version of fw, we can move the cliff from 240CUs for groupgemm, see the following table:
+With a newer version of fw, we can move the perf cliff to 240CUs, see the following table:
 
-(add a table here for perf numbers)
+### CK Performance numbers (newer firmware):
+
+| GRID_DIM | GroupedGEMM<br>only (ms) | Sequential<br>(ms) | Overlap<br>GroupedGEMM<br>(ms) | Overlap<br>wall (ms) | Slowdown<br>(overlap/<br>groupedgemm) |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 3.443 | 3.610 | 3.784 | 3.834 | 1.10× |
+| 192 | 2.510 | 2.684 | 2.817 | 2.877 | 1.12× |
+| 208 | 2.402 | 2.547 | 2.652 | 2.704 | 1.10× |
+| 216 | 2.287 | 2.437 | 2.561 | 2.621 | 1.12× |
+| 220 | 2.260 | 2.447 | 2.516 | 2.567 | 1.11× |
+| 224 | 2.227 | 2.406 | 2.480 | 2.531 | 1.11× |
+| 228 | 2.210 | 2.376 | 2.463 | 2.515 | 1.11× |
+| 232 | 2.189 | 2.358 | 2.450 | 2.501 | 1.12× |
+| 240 | 2.195 | 2.319 | 2.413 | 2.463 | 1.10× |
+| 244 | 2.188 | 2.320 | 4.579 | 4.639 | 2.09× |
+| 248 | 2.156 | 2.289 | 4.418 | 4.471 | 2.05× |
+| 256 | 2.058 | 2.169 | 4.172 | 4.227 | 2.03× |
 
 ## 4. ATT Trace Analysis
 
@@ -210,7 +228,7 @@ any work.
 
 With the work stealing optimization, we got the following performance numbers:
 
-| GRID_DIM | GEMM only (ms) | Sequential (ms) | Overlap GEMM (ms) | Overlap wall (ms) | Slowdown (overlap/gemm) |
+| GRID_DIM | GroupedGEMM<br>only (ms) | Sequential<br>(ms) | Overlap<br>GroupedGEMM<br>(ms) | Overlap<br>wall (ms) | Slowdown<br>(overlap/<br>groupedgemm) |
 |---:|---:|---:|---:|---:|---:|
 | 128 | 3.597 | 3.798 | 3.873 | 3.925 | 1.08× |
 | 192 | 2.531 | 2.803 | 2.821 | 2.868 | 1.11× |
