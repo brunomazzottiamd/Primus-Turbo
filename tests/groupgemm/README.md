@@ -18,6 +18,13 @@ table and machine-parseable CSV. This script calls the GroupGEMM implementations
 [Primus-Turbo](https://github.com/AMD-AIG-AIMA/Primus-Turbo) repository, an AMD library of 
 optimized GPU kernels. 
 
+### Distributed setup
+
+Each process group for concurrent all-gathers is allocated independently (`dist.new_group`) so
+that multiple RCCL communicators can run in parallel without serializing on a single stream.
+Communication happens on dedicated `torch.cuda.Stream` objects; the compute stream only
+synchronizes with them at wall-time measurement boundaries.
+
 ### Usage
 
 ```bash
@@ -90,36 +97,32 @@ NCCL_MAX_NCHANNELS=16 torchrun --nproc_per_node=8 bench_overlap.py \
   --ag-size-mb 512 --grid-dims 128,192,208,216,220,224,228,232,240,248,256
 ``` 
 
-We get the following perf numbers:
-
-Config: G=32, M=267424, K=1280, N=2560, world_size=8, backend=primus, ag-size=512 MB, NCCL_MAX_NCHANNELS=16.
-All-gather alone: 43.724 ms. All values are mean over 20 iterations after 5 warm-up iterations.
+We get the following perf numbers for the Triton backend:
 
 | GRID_DIM | GEMM only (ms) | Sequential (ms) | Overlap GEMM (ms) | Overlap wall (ms) | Slowdown (overlap/gemm) |
 |---:|---:|---:|---:|---:|---:|
-| 128 | 2.680 | 2.990 | 2.996 | 3.054 | 1.12× |
-| 192 | 1.977 | 2.153 | 2.195 | 2.255 | 1.11× |
-| 208 | 1.913 | 2.048 | 2.073 | 2.119 | 1.08× |
-| 216 | 1.949 | 1.981 | 2.035 | 2.081 | 1.04× |
-| 220 | 1.887 | 1.991 | 2.010 | 2.054 | 1.07× |
-| 224 | 1.891 | 1.944 | 1.968 | 2.014 | 1.04× |
-| 228 | 1.885 | 1.932 | 3.806 | 3.849 | 2.02× |
-| 232 | 1.854 | 1.906 | 3.731 | 3.776 | 2.01× |
-| 240 | 1.846 | 1.859 | 3.680 | 3.724 | 1.99× |
-| 248 | 1.820 | 1.854 | 3.522 | 3.566 | 1.94× |
-| 256 | 1.783 | 1.830 | 3.456 | 3.501 | 1.94× |
+| 128 | 3.603 | 3.811 | 3.863 | 3.914 | 1.07× |
+| 192 | 2.522 | 2.778 | 2.823 | 2.872 | 1.12× |
+| 208 | 2.411 | 2.607 | 2.650 | 2.697 | 1.10× |
+| 216 | 2.357 | 2.553 | 2.604 | 2.654 | 1.11× |
+| 220 | 2.368 | 2.534 | 2.584 | 2.632 | 1.09× |
+| 224 | 2.294 | 2.493 | 2.521 | 2.571 | 1.10× |
+| 228 | 2.240 | 2.438 | 4.868 | 4.916 | 2.17× |
+| 232 | 2.249 | 2.419 | 4.751 | 4.800 | 2.11× |
+| 240 | 2.194 | 2.366 | 4.634 | 4.681 | 2.11× |
+| 248 | 2.150 | 2.305 | 4.456 | 4.505 | 2.07× |
+| 256 | 2.150 | 2.275 | 4.365 | 4.413 | 2.03× |
 
 MI350 contains 256 CUs. With RCCL kernel using 16 CUs, when GroupGEMM use 240 or less CUs, there should be no performance
 degradation, but this table shows a big slowdown when groupGEMM uses 228 or more CUs.
-
 
 ## 4. ATT Trace Analysis
 
 
 
-### Root cause
+## 5. Root cause
 
-The CK Grouped GEMM kernel in its original form used a **static tile assignment**: each
+The Triton Grouped GEMM kernel in its original form used a **static tile assignment**: each
 wave-front (CU) received a fixed subset of output tiles pre-determined at launch time via a
 round-robin stride pattern (`for global_tile_id in range(pid, total_tiles, NUM_XCDS)`).  When
 RCCL all-gather traffic simultaneously saturates the HBM bus and PCIe/xGMI interconnect, some
@@ -127,7 +130,7 @@ CUs stall waiting on memory while others finish early.  Because tiles are static
 early-finishing CUs sit idle while stalled CUs still hold work — the kernel cannot retire until
 the *slowest* CU finishes, so RCCL-induced memory pressure linearly inflates the GEMM latency.
 
-### Fix: work stealing via a GPU-side atomic counter
+## 6. Fix: work stealing via a GPU-side atomic counter
 
 Replacing the static stride loop with a **GPU-side atomic counter** (`tl.atomic_add`) converts
 tile assignment to fully dynamic work stealing.  CUs that finish their current tile immediately
@@ -135,124 +138,31 @@ atomically claim the next available global tile.  Stalled CUs simply claim fewer
 absorb the slack.  This decouples GEMM completion time from any single CU's memory latency,
 restoring near-baseline performance even under heavy RCCL traffic.
 
----
+### After optimization
 
+With the work stealing optimization, we got the following performance numbers:
 
-### Distributed setup
-
-Each process group for concurrent all-gathers is allocated independently (`dist.new_group`) so
-that multiple RCCL communicators can run in parallel without serializing on a single stream.
-Communication happens on dedicated `torch.cuda.Stream` objects; the compute stream only
-synchronizes with them at wall-time measurement boundaries.
-
----
-
-## 3. Work-Stealing Optimization in `grouped_gemm_kernel.py`
-
-### File
-
-`primus_turbo/triton/grouped_gemm/grouped_gemm_kernel.py`
-
-### Kernel: `_grouped_bf16_persistent_gemm_kernel`
-
-The kernel is a **persistent grouped GEMM** that processes all groups and all output tiles in a
-single launch.  Each CU iterates over tiles assigned to it, computes A × B for the
-corresponding `(group, row-block, col-block)` triple, and stores the result.
-
-### Before: static round-robin tile assignment
-
-```python
-for global_tile_id in range(pid, total_tiles, NUM_SMS):
-    # ... compute tile global_tile_id ...
-```
-
-Every CU received tiles `pid, pid+NUM_SMS, pid+2*NUM_SMS, …` — a fixed, non-negotiable
-partition.  If a CU stalled due to cache misses or HBM congestion (exacerbated by concurrent
-RCCL traffic), its tiles were not reassigned and the entire kernel was delayed.
-
-### After: dynamic work stealing via GPU-side atomic counter
-
-**Commit `91b6be3` (initial implementation)** introduced a `global_counter` tensor (a single
-`int32` on device) and used `tl.atomic_add` inside the loop to dynamically fetch the next tile:
-
-```python
-# Python side: allocate counter, pre-initialized to 0
-global_counter = torch.zeros((1,), dtype=torch.int32, device=a.device)
-
-# Kernel: each CU atomically claims next tile
-for _ in range(0, tiles_per_sm):           # static upper bound per CU
-    global_tile_id = tl.atomic_add(global_counter, 1, sem="relaxed", scope='gpu')
-    # ... compute tile global_tile_id ...
-```
-
-A static upper bound `tiles_per_sm = total_tiles // NUM_SMS (+ 1 if remainder)` was used to
-bound the loop trip count so the Triton compiler could reason about it statically.
-
-**Commit `1ae70a9` (refined implementation)** replaced the bounded for-loop with an open-ended
-`while` loop, moving the `tl.atomic_add` to the *end* of the loop body.  The counter is
-initialized to `num_sms` so each CU starts on its `pid`-th tile (preserving the locality hint
-of the first tile) and then work-steals from there:
-
-```python
-# Python side: pre-seed counter so CU pid starts on tile pid
-global_counter = torch.zeros((1,), dtype=torch.int32, device=a.device) + num_sms
-
-# Kernel: start on tile = pid, then steal
-global_tile_id = pid
-while global_tile_id < total_tiles:
-    # ... compute tile global_tile_id ...
-    global_tile_id = tl.atomic_add(global_counter, 1, sem="relaxed", scope='gpu')
-```
-
-This design has two advantages over the for-loop version:
-- **No wasted iterations**: the `while` condition exits immediately when all tiles are claimed,
-  even if a CU would have been given more tiles by the static upper bound.
-- **First tile locality**: each CU begins with the same tile it would have processed in the
-  round-robin scheme (tile `pid`), preserving cache locality for the common case where load is
-  balanced.  Only subsequent tiles are work-stolen.
-
-The `sem="relaxed"` ordering and `scope='gpu'` ensure the atomic is device-wide but does not
-impose unnecessary memory fences, keeping the critical path short.
+| GRID_DIM | GEMM only (ms) | Sequential (ms) | Overlap GEMM (ms) | Overlap wall (ms) | Slowdown (overlap/gemm) |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 3.597 | 3.798 | 3.873 | 3.925 | 1.08× |
+| 192 | 2.531 | 2.803 | 2.821 | 2.868 | 1.11× |
+| 208 | 2.381 | 2.628 | 2.660 | 2.708 | 1.12× |
+| 216 | 2.367 | 2.575 | 2.650 | 2.698 | 1.12× |
+| 220 | 2.364 | 2.558 | 2.609 | 2.656 | 1.10× |
+| 224 | 2.302 | 2.490 | 2.543 | 2.591 | 1.10× |
+| 228 | 2.278 | 2.449 | 2.538 | 2.586 | 1.11× |
+| 232 | 2.230 | 2.412 | 2.518 | 2.566 | 1.13× |
+| 240 | 2.147 | 2.358 | 2.503 | 2.550 | 1.17× |
+| 248 | 2.151 | 2.292 | 2.520 | 2.568 | 1.17× |
+| 256 | 2.054 | 2.227 | 2.518 | 2.565 | 1.23× |
 
 ---
 
-## 4. Performance Results
+From the results, we can see that the biggest slowdown is 23% compared to running the GroupGEMM using all 256CUs.
+There are two factor invovlved when overlapping with RCCL, 16 fewer CUs are used for GroupGEMM and there is a 
+general 10% overhead.
 
-### Setup
 
-- Hardware: AMD MI300X (8 GPUs, 8 XCDs per GPU, 304 CUs)
-- Software: ROCm, Triton for ROCm, RCCL
-- Shape: G=8, M=4096, K=4096, N=4096 (default), bf16
-- All-gather: 64 MiB tensor
-- Measured: 20 iterations after 5 warm-up
-
-### Before optimization (static round-robin)
-
-| Scenario | Mean (ms) | Slowdown vs GEMM-only |
-|---|---|---|
-| GEMM only | ~8.2 | 1.00× |
-| Sequential (AG then GEMM) | ~8.3 | 1.01× |
-| Overlap — GEMM time | ~22–30 | **2.7–3.7×** |
-| Overlap — wall time | ~22–30 | — |
-
-Under RCCL overlap, the GEMM kernel experienced a 2.7–3.7× slowdown.  The wall time did not
-decrease below `ag_alone + gemm_only`, confirming the GEMM was the bottleneck rather than true
-overlap being achieved.
-
-### After optimization (work stealing)
-
-| Scenario | Mean (ms) | Slowdown vs GEMM-only |
-|---|---|---|
-| GEMM only | ~8.2 | 1.00× |
-| Sequential (AG then GEMM) | ~8.3 | 1.01× |
-| Overlap — GEMM time | ~9.0–10.5 | **~1.1–1.3×** |
-| Overlap — wall time | ~14–18 | overlap=YES |
-
-With work stealing, the GEMM slowdown under concurrent RCCL traffic dropped to roughly 10–30%
-(from 170–270%), and the wall time fell below `ag_alone + gemm_only`, confirming genuine
-overlap.  The residual ~10–30% overhead reflects real contention for HBM bandwidth between
-compute and RCCL DMA engines, which is unavoidable; the dramatic stall from load imbalance is
-eliminated.
 
 ### Why the improvement is large
 
