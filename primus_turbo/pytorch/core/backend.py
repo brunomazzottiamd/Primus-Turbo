@@ -277,6 +277,7 @@ class BackendEntry:
 
     impl: Type[KernelBackend]
     autotune: bool = True
+    work_stealing: bool = False
 
 
 class TuneCache:

@@ -173,7 +173,7 @@ def run_grouped_gemm_triton(lhs, rhs, group_sizes, out, M, K, N, G, grid_dim, nu
 
 def run_grouped_gemm_primus(lhs, rhs, group_lens, out, M, K, N, G, num_cu, _num_xcds):
     from primus_turbo.pytorch.ops import grouped_gemm as pt_grouped_gemm
-    return pt_grouped_gemm(lhs, rhs, group_lens, trans_b=_primus_trans_b, num_cu=num_cu)
+    return pt_grouped_gemm(lhs, rhs, group_lens, trans_b=_primus_trans_b, num_cu=num_cu, work_stealing=_primus_work_stealing)
 
 
 # Default — overridden by main() based on --backend
@@ -399,6 +399,8 @@ def main():
                         help="Grouped GEMM backend: 'triton' (built-in) or 'primus' (Primus-Turbo CK)")
     parser.add_argument("--trans-b", action="store_true",
                         help="Use transposed weight layout [G, N, K] (Primus backend only)")
+    parser.add_argument("--work-stealing", action="store_true",
+                        help="Enable work-stealing tile scheduler (Primus backend only)")
     args = parser.parse_args()
 
     local_rank, world_size, rank = setup_distributed()
@@ -408,8 +410,9 @@ def main():
     grid_dims = [int(x.strip()) for x in args.grid_dims.split(",")]
     backend = args.backend
 
-    global run_grouped_gemm, _primus_trans_b
+    global run_grouped_gemm, _primus_trans_b, _primus_work_stealing
     _primus_trans_b = args.trans_b
+    _primus_work_stealing = args.work_stealing
     if backend == "triton":
         # Ensure K is divisible by BLOCK_K=64
         assert K % 64 == 0, f"K={K} must be divisible by 64"

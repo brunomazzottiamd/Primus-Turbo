@@ -180,6 +180,132 @@ def _chiplet_transform_chunked(
 
 
 @triton.jit()
+def _grouped_gemm_bf16_process_tile(
+    tile_id,
+    A,  # [M_total, K]
+    B,  # [G, ?, ?]  — (K,N) or (N,K) depending on trans_b
+    C,  # [M_total, N]
+    group_offs_ptr,  # [G+1] int64
+    # Dimensions
+    G,  # number of groups (runtime)
+    N,
+    K,
+    # Strides
+    stride_am,  # A row stride
+    stride_bg,  # B group stride: b.stride(0)
+    stride_bn,  # B N-stride (within a group)
+    stride_cm,  # C row stride
+    stride_cn,  # C col stride
+    # Constexpr strides (for compiler optimisation)
+    stride_ak: tl.constexpr,  # A K-stride (=1 when trans_a=False, contiguous)
+    stride_bk: tl.constexpr,  # B K-stride (=1 when trans_b=True)
+    # Tile config
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    CACHE_MODIFIER_A: tl.constexpr,
+    CACHE_MODIFIER_B: tl.constexpr,
+    ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
+):
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    
+    # ── Find group via linear scan (O(G)) ──
+    group_idx: tl.int32 = 0
+    tile_start: tl.int32 = 0
+    cumsum: tl.int32 = 0
+    for _g in range(G):
+        m_g_i = (tl.load(group_offs_ptr + _g + 1) - tl.load(group_offs_ptr + _g)).to(tl.int32)
+        tiles_g = tl.cdiv(m_g_i, BLOCK_SIZE_M) * num_pid_n
+        new_cumsum = cumsum + tiles_g
+        if tile_id >= new_cumsum:
+            group_idx = _g + 1
+            tile_start = new_cumsum
+        cumsum = new_cumsum
+
+    # ── Group-local tile → (pid_m, pid_n) with GROUP_SIZE_M swizzle ──
+    local_tile = tile_id - tile_start
+    m_start_g = tl.load(group_offs_ptr + group_idx)  # keep int64 to avoid address overflow
+    M_g = (tl.load(group_offs_ptr + group_idx + 1) - tl.load(group_offs_ptr + group_idx)).to(tl.int32)
+    tiles_m_g = tl.cdiv(M_g, BLOCK_SIZE_M)
+
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    swizzle_group = local_tile // num_pid_in_group
+    first_pid_m = swizzle_group * GROUP_SIZE_M
+    group_size_m = min(tiles_m_g - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((local_tile % num_pid_in_group) % group_size_m)
+    pid_n = (local_tile % num_pid_in_group) // group_size_m
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+
+    # ── Address computation ──
+    rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M_g
+    rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    rk = tl.arange(0, BLOCK_SIZE_K)
+    rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+
+    # Cast group_idx to int64 to prevent overflow in B group offset
+    # (group_idx * stride_bg can exceed int32 when B has many groups)
+    group_offset_b = group_idx.to(tl.int64) * stride_bg
+
+    A_BASE = A + m_start_g * stride_am + rm[:, None] * stride_am + rk[None, :] * stride_ak
+    B_BASE = B + group_offset_b + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+
+    # ── K-loop (identical to single GEMM) ──
+    loop_k = tl.cdiv(K, BLOCK_SIZE_K)
+    if not EVEN_K:
+        loop_k -= 1
+    tl.assume(loop_k > 1)
+
+    acc_dtype = tl.float32
+
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+    for k in range(0, loop_k):
+        if stride_ak == 1:
+            a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_A)
+        else:
+            a = tl.load(tl.multiple_of(A_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_A)
+
+        if stride_bk == 1:
+            b = tl.load(tl.multiple_of(B_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_B)
+        else:
+            b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_B)
+
+        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+        A_BASE += BLOCK_SIZE_K * stride_ak
+        B_BASE += BLOCK_SIZE_K * stride_bk
+
+    if not EVEN_K:
+        rk_last = loop_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+        A_LAST = A + m_start_g * stride_am + rm[:, None] * stride_am + rk_last[None, :] * stride_ak
+        B_LAST = B + group_offset_b + rk_last[:, None] * stride_bk + rn[None, :] * stride_bn
+        if stride_ak == 1:
+            A_LAST = tl.multiple_of(A_LAST, (1, 16))
+        else:
+            A_LAST = tl.multiple_of(A_LAST, (16, 1))
+        if stride_bk == 1:
+            B_LAST = tl.multiple_of(B_LAST, (16, 1))
+        else:
+            B_LAST = tl.multiple_of(B_LAST, (1, 16))
+        a = tl.load(A_LAST, mask=rk_last[None, :] < K, other=0.0, cache_modifier=CACHE_MODIFIER_A)
+        b = tl.load(B_LAST, mask=rk_last[:, None] < K, other=0.0, cache_modifier=CACHE_MODIFIER_B)
+        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+
+    # ── Store ──
+    c = acc.to(C.type.element_ty)
+    rm_s = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M_g
+    rn_s = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    rn_s = tl.max_contiguous(tl.multiple_of(rn_s, BLOCK_SIZE_N), BLOCK_SIZE_N)
+    c_mask = (rm_s[:, None] < M_g) & (rn_s[None, :] < N)
+    C_ = C + m_start_g * stride_cm + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
+    tl.store(C_, c, c_mask)
+
+
+@triton.jit()
 def _grouped_bf16_persistent_gemm_kernel(
     # Pointers
     A,  # [M_total, K]
@@ -199,7 +325,6 @@ def _grouped_bf16_persistent_gemm_kernel(
     # Constexpr strides (for compiler optimisation)
     stride_ak: tl.constexpr,  # A K-stride (=1 when trans_a=False, contiguous)
     stride_bk: tl.constexpr,  # B K-stride (=1 when trans_b=True)
-    global_counter,
     # Tile config
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -211,6 +336,8 @@ def _grouped_bf16_persistent_gemm_kernel(
     EVEN_K: tl.constexpr,
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
+    WORK_STEALING: tl.constexpr = False,
+    global_counter: torch.Tensor = None,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
 ):
     """Persistent grouped GEMM kernel (CPU-sync-free).
@@ -239,101 +366,76 @@ def _grouped_bf16_persistent_gemm_kernel(
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
 
-    acc_dtype = tl.float32
-
-    # for global_tile_id in range(pid, total_tiles, NUM_SMS):
-    # global_tile_id = tl.atomic_add(global_counter, 1, sem="relaxed", scope='gpu')
-    global_tile_id = pid
-    while global_tile_id < total_tiles:
-        # ── Find group via linear scan (O(G)) ──
-        group_idx: tl.int32 = 0
-        tile_start: tl.int32 = 0
-        cumsum: tl.int32 = 0
-        for _g in range(G):
-            m_g_i = (tl.load(group_offs_ptr + _g + 1) - tl.load(group_offs_ptr + _g)).to(tl.int32)
-            tiles_g = tl.cdiv(m_g_i, BLOCK_SIZE_M) * num_pid_n
-            new_cumsum = cumsum + tiles_g
-            if global_tile_id >= new_cumsum:
-                group_idx = _g + 1
-                tile_start = new_cumsum
-            cumsum = new_cumsum
-
-        # ── Group-local tile → (pid_m, pid_n) with GROUP_SIZE_M swizzle ──
-        local_tile = global_tile_id - tile_start
-        m_start_g = tl.load(group_offs_ptr + group_idx)  # keep int64 to avoid address overflow
-        M_g = (tl.load(group_offs_ptr + group_idx + 1) - tl.load(group_offs_ptr + group_idx)).to(tl.int32)
-        tiles_m_g = tl.cdiv(M_g, BLOCK_SIZE_M)
-
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        swizzle_group = local_tile // num_pid_in_group
-        first_pid_m = swizzle_group * GROUP_SIZE_M
-        group_size_m = min(tiles_m_g - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + ((local_tile % num_pid_in_group) % group_size_m)
-        pid_n = (local_tile % num_pid_in_group) // group_size_m
-        tl.assume(pid_m >= 0)
-        tl.assume(pid_n >= 0)
-
-        # ── Address computation ──
-        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M_g
-        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-        rk = tl.arange(0, BLOCK_SIZE_K)
-        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
-
-        # Cast group_idx to int64 to prevent overflow in B group offset
-        # (group_idx * stride_bg can exceed int32 when B has many groups)
-        group_offset_b = group_idx.to(tl.int64) * stride_bg
-
-        A_BASE = A + m_start_g * stride_am + rm[:, None] * stride_am + rk[None, :] * stride_ak
-        B_BASE = B + group_offset_b + rk[:, None] * stride_bk + rn[None, :] * stride_bn
-
-        # ── K-loop (identical to single GEMM) ──
-        loop_k = tl.cdiv(K, BLOCK_SIZE_K)
-        if not EVEN_K:
-            loop_k -= 1
-        tl.assume(loop_k > 1)
-
-        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
-        for k in range(0, loop_k):
-            if stride_ak == 1:
-                a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_A)
-            else:
-                a = tl.load(tl.multiple_of(A_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_A)
-
-            if stride_bk == 1:
-                b = tl.load(tl.multiple_of(B_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_B)
-            else:
-                b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_B)
-
-            acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
-            A_BASE += BLOCK_SIZE_K * stride_ak
-            B_BASE += BLOCK_SIZE_K * stride_bk
-
-        if not EVEN_K:
-            rk_last = loop_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-            A_LAST = A + m_start_g * stride_am + rm[:, None] * stride_am + rk_last[None, :] * stride_ak
-            B_LAST = B + group_offset_b + rk_last[:, None] * stride_bk + rn[None, :] * stride_bn
-            if stride_ak == 1:
-                A_LAST = tl.multiple_of(A_LAST, (1, 16))
-            else:
-                A_LAST = tl.multiple_of(A_LAST, (16, 1))
-            if stride_bk == 1:
-                B_LAST = tl.multiple_of(B_LAST, (16, 1))
-            else:
-                B_LAST = tl.multiple_of(B_LAST, (1, 16))
-            a = tl.load(A_LAST, mask=rk_last[None, :] < K, other=0.0, cache_modifier=CACHE_MODIFIER_A)
-            b = tl.load(B_LAST, mask=rk_last[:, None] < K, other=0.0, cache_modifier=CACHE_MODIFIER_B)
-            acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
-
-        # ── Store ──
-        c = acc.to(C.type.element_ty)
-        rm_s = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M_g
-        rn_s = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-        rn_s = tl.max_contiguous(tl.multiple_of(rn_s, BLOCK_SIZE_N), BLOCK_SIZE_N)
-        c_mask = (rm_s[:, None] < M_g) & (rn_s[None, :] < N)
-        C_ = C + m_start_g * stride_cm + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
-        tl.store(C_, c, c_mask)
-
-        global_tile_id = tl.atomic_add(global_counter, 1, sem="relaxed", scope='gpu')
+    if WORK_STEALING:
+        global_tile_id = pid
+        while global_tile_id < total_tiles:
+            _grouped_gemm_bf16_process_tile(
+                global_tile_id,
+                A,
+                B,
+                C,
+                group_offs_ptr,
+                # Dimensions
+                G,
+                N,
+                K,
+                # Strides
+                stride_am,
+                stride_bg,
+                stride_bn,
+                stride_cm,
+                stride_cn,
+                # Constexpr strides (for compiler optimisation)
+                stride_ak,
+                stride_bk,
+                # Tile config
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                GROUP_SIZE_M,
+                NUM_SMS,
+                NUM_XCDS,
+                CHUNK_SIZE,
+                EVEN_K,
+                CACHE_MODIFIER_A,
+                CACHE_MODIFIER_B,
+                ALLOW_TF32,
+            )
+            global_tile_id = tl.atomic_add(global_counter, 1, sem="relaxed", scope='gpu')
+    else:
+        for global_tile_id in range(pid, total_tiles, NUM_SMS):
+            _grouped_gemm_bf16_process_tile(
+                global_tile_id,
+                A,
+                B,
+                C,
+                group_offs_ptr,
+                # Dimensions
+                G,
+                N,
+                K,
+                # Strides
+                stride_am,
+                stride_bg,
+                stride_bn,
+                stride_cm,
+                stride_cn,
+                # Constexpr strides (for compiler optimisation)
+                stride_ak,
+                stride_bk,
+                # Tile config
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                GROUP_SIZE_M,
+                NUM_SMS,
+                NUM_XCDS,
+                CHUNK_SIZE,
+                EVEN_K,
+                CACHE_MODIFIER_A,
+                CACHE_MODIFIER_B,
+                ALLOW_TF32,
+            )
 
 
 def grouped_gemm_triton_kernel(
@@ -342,6 +444,7 @@ def grouped_gemm_triton_kernel(
     group_offs: torch.Tensor,
     trans_b: bool = False,
     grid_dim: Optional[int] = None,
+    work_stealing: bool = False,
 ) -> torch.Tensor:
     """Persistent grouped GEMM (CPU-sync-free) using Triton.
 
@@ -412,7 +515,6 @@ def grouped_gemm_triton_kernel(
         out.stride(1),  # stride_cn
         stride_ak=stride_ak,
         stride_bk=stride_bk,
-        global_counter=global_counter,
         BLOCK_SIZE_M=BLOCK_M,
         BLOCK_SIZE_N=BLOCK_N,
         BLOCK_SIZE_K=BLOCK_K,
@@ -423,6 +525,8 @@ def grouped_gemm_triton_kernel(
         EVEN_K=even_k,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
+        WORK_STEALING=work_stealing,
+        global_counter=global_counter,
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,
@@ -604,7 +708,7 @@ def grouped_gemm_variable_k_triton_kernel(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
     group_offs: torch.Tensor,
-    grid_dim: Optional[int] = None,
+    num_cus: Optional[int] = None,
 ) -> torch.Tensor:
     """Variable-K grouped BF16/FP16 GEMM (backward) using Triton.
 
@@ -626,7 +730,7 @@ def grouped_gemm_variable_k_triton_kernel(
     G = group_offs.shape[0] - 1
 
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=lhs.dtype)
-    num_sms = _get_num_cus() if grid_dim is None else grid_dim
+    num_sms = _get_num_cus() if num_cus is None else num_cus
     dummy_scale = torch.empty(1, device=lhs.device, dtype=torch.float32)
 
     if _is_gfx950():

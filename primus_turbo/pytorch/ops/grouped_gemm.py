@@ -29,6 +29,7 @@ class GroupedGemmFunc(torch.autograd.Function):
         group_offs: torch.Tensor,  # [B+1,] int64
         trans_b: bool,
         num_cu: int | None,
+        work_stealing: bool,
     ):
         if len(group_lens) == 1:
             assert b.size(0) == 1, f"Expected first dimension to be 1, got {b.size(0)}"
@@ -45,8 +46,9 @@ class GroupedGemmFunc(torch.autograd.Function):
                 trans_a=False,
                 trans_b=trans_b,
                 num_cu=num_cu,
-                default_backend=BackendType.TRITON.value,
+                default_backend=BackendType.CK.value,
                 maybe_pre_sync=True,
+                work_stealing=work_stealing,
             )
         ctx.save_for_backward(a, b, group_lens, group_offs)
         ctx.trans_a = False
@@ -103,7 +105,7 @@ class GroupedGemmFunc(torch.autograd.Function):
                 num_cu=ctx.num_cu,
                 default_backend=BackendType.TRITON.value,
             )
-        return grad_a, grad_b, None, None, None, None
+        return grad_a, grad_b, None, None, None, None, None
 
 
 def grouped_gemm(
@@ -113,6 +115,7 @@ def grouped_gemm(
     group_offs: torch.Tensor | None = None,
     trans_b: bool = False,
     num_cu: int | None = None,
+    work_stealing: bool = False,
 ) -> torch.Tensor:
     """
     Grouped GEMM.
@@ -125,6 +128,7 @@ def grouped_gemm(
                                           If None, it will be computed internally.
         trans_b (bool): If True, treat each b[g] as transposed.
         num_cu (int | None): Limit the number of CUs to use. None = default.
+        work_stealing (bool): If True, use work-stealing tile scheduler (Triton backend only).
 
     Returns:
         torch.Tensor: Output of shape [sum(group_lens), N], same dtype/device as `a`.
@@ -141,4 +145,4 @@ def grouped_gemm(
     if group_offs is None:
         group_offs = grouped_gemm_compute_offs(group_lens)
 
-    return GroupedGemmFunc.apply(a, b, group_lens, group_offs, trans_b, num_cu)
+    return GroupedGemmFunc.apply(a, b, group_lens, group_offs, trans_b, num_cu, work_stealing)

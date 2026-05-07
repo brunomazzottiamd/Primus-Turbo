@@ -209,15 +209,16 @@ class GroupedGEMMTritonBackend(KernelBackend):
         trans_a: bool,
         trans_b: bool,
         num_cu: int | None,
+        work_stealing = False,
         **kwargs,
     ) -> torch.Tensor:
-        return grouped_gemm_triton_kernel(a, b, group_offs, trans_b=trans_b, grid_dim=num_cu)
+        return grouped_gemm_triton_kernel(a, b, group_offs, trans_b=trans_b, grid_dim=num_cu, work_stealing=work_stealing)
 
 
 _GROUPED_GEMM_BACKENDS = {
     BackendType.CK: BackendEntry(GroupedGEMMCKBackend),
     BackendType.HIPBLASLT: BackendEntry(GroupedGEMMHipblasltBackend, autotune=False),
-    BackendType.TRITON: BackendEntry(GroupedGEMMTritonBackend),
+    BackendType.TRITON: BackendEntry(GroupedGEMMTritonBackend, work_stealing=True),
 }
 
 
@@ -313,6 +314,7 @@ def grouped_gemm_impl(
     num_cu: int | None,
     default_backend: int,
     maybe_pre_sync: bool = False,
+    work_stealing: bool = False,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
@@ -326,6 +328,7 @@ def grouped_gemm_impl(
         trans_b=trans_b,
         num_cu=num_cu,
         maybe_pre_sync=maybe_pre_sync,
+        work_stealing=work_stealing,
     )
 
     return GroupedGEMMKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
