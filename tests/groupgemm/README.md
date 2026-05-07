@@ -163,9 +163,9 @@ With a newer version of fw, we can move the perf cliff to 240CUs, see the follow
 ## 4. ATT Trace Analysis
 
 ATT trace indicates that with RCCL using 16 CUs, there are 240 CUs availabe for groupgemm, but the firmware algorithm stills
-dispatches two workgroups to the same CUs, which doubles kernel time, and at the same time, there are 13CUs idle.
+dispatches two workgroups to the same CUs, which doubles kernel time on one of the CUs, and at the same time, there are 13CUs idle.
 
-(Add a picture for the ATT trace)
+![CU Occupancy ATT Trace](CU_occupancy.jpg)
 
 ## 5. Optimization
 
@@ -252,8 +252,8 @@ general 10% overhead.
 ### Why the improvement is large
 
 Without work stealing, a single stalled CU forces all other CUs to wait because the kernel
-cannot retire until every CU finishes its statically assigned tiles.  Under RCCL traffic, a
-fraction of CUs experience severe HBM latency; the effective kernel time becomes `max(CU
+cannot retire until every CU finishes its statically assigned tiles. With RCCL and groupgemm kernels dispatched
+to the same CU, a fraction of CUs experience severe HBM latency; the effective kernel time becomes `max(CU
 latencies)` rather than `mean(CU latencies)`.  Work stealing converts the effective latency to
 approximately `mean + small_steal_overhead`, a much better outcome when variance across CUs is
 high.
