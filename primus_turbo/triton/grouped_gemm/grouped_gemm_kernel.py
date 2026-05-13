@@ -249,7 +249,6 @@ def _grouped_gemm_bf16_process_tile(
     rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M_g
     rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     rk = tl.arange(0, BLOCK_SIZE_K)
-    rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
 
     # Cast group_idx to int64 to prevent overflow in B group offset
     # (group_idx * stride_bg can exceed int32 when B has many groups)
@@ -269,14 +268,11 @@ def _grouped_gemm_bf16_process_tile(
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, loop_k):
-        a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_A)
-
-        if TRANS_RHS:
-            b = tl.load(tl.multiple_of(B_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_B)
-        else:
-            b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_B)
+        a = tl.load(A_BASE)
+        b = tl.load(B_BASE)
 
         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+
         A_BASE += BLOCK_SIZE_K
         if TRANS_RHS:
             B_BASE += BLOCK_SIZE_K
@@ -285,25 +281,21 @@ def _grouped_gemm_bf16_process_tile(
 
     if not EVEN_K:
         rk_last = loop_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+
         A_LAST = A + m_start_g * K + rm[:, None] * K + rk_last[None, :]
         if TRANS_RHS:
             B_LAST = B + group_offset_b + rk_last[:, None] + rn[None, :] * K
         else:
             B_LAST = B + group_offset_b + rk_last[:, None] * N + rn[None, :]
-        A_LAST = tl.multiple_of(A_LAST, (1, 16))
-        if TRANS_RHS:
-            B_LAST = tl.multiple_of(B_LAST, (16, 1))
-        else:
-            B_LAST = tl.multiple_of(B_LAST, (1, 16))
-        a = tl.load(A_LAST, mask=rk_last[None, :] < K, other=0.0, cache_modifier=CACHE_MODIFIER_A)
-        b = tl.load(B_LAST, mask=rk_last[:, None] < K, other=0.0, cache_modifier=CACHE_MODIFIER_B)
+
+        a = tl.load(A_LAST, mask=rk_last[None, :] < K, other=0.0)
+        b = tl.load(B_LAST, mask=rk_last[:, None] < K, other=0.0)
         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
 
     # ── Store ──
     c = acc.to(C.type.element_ty)
     rm_s = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M_g
     rn_s = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    rn_s = tl.max_contiguous(tl.multiple_of(rn_s, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_mask = (rm_s[:, None] < M_g) & (rn_s[None, :] < N)
     C_ = C + m_start_g * N + rm_s[:, None] * N + rn_s[None, :]
     tl.store(C_, c, c_mask)
