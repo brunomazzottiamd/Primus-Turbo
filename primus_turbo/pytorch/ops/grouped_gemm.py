@@ -46,7 +46,7 @@ class GroupedGemmFunc(torch.autograd.Function):
                 trans_a=False,
                 trans_b=trans_b,
                 num_cu=num_cu,
-                default_backend=BackendType.CK.value,
+                default_backend=BackendType.TRITON.value,
                 maybe_pre_sync=True,
                 work_stealing=work_stealing,
             )
