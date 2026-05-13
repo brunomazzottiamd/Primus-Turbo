@@ -39,7 +39,10 @@ from primus_turbo.triton.gemm.gemm_kernel import (
 # ═══════════════════════════════════════════════════════════════════════════════
 
 NUM_XCDS = 8
-_NUM_CUS: int | None = None
+# Padding for per-XCD atomic counter slots: 64 * 4B = 256 B = one MI355X L2
+# line per slot, so the eight XCDs do not false-share a cache line.
+COUNTER_STRIDE = 64
+_NUM_CUS: Optional[int] = None
 
 
 def _get_num_cus() -> int:
@@ -48,6 +51,17 @@ def _get_num_cus() -> int:
     if _NUM_CUS is None:
         _NUM_CUS = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     return _NUM_CUS
+
+
+def allocate_ws_counter_buf(device, num_xcds: int = NUM_XCDS) -> torch.Tensor:
+    """Allocate the work-stealing counter buffer.
+
+    Layout: [xcd0_slot, ..., xcd{num_xcds-1}_slot, global_slot], each slot
+    occupying COUNTER_STRIDE int32 elements.
+    """
+    return torch.zeros(
+        (num_xcds + 1) * COUNTER_STRIDE, dtype=torch.int32, device=device
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -196,6 +210,7 @@ def _grouped_gemm_bf16_process_tile(
     stride_bn,  # B N-stride (within a group)
     stride_cm,  # C row stride
     stride_cn,  # C col stride
+    num_pid_n,
     # Constexpr strides (for compiler optimisation)
     stride_ak: tl.constexpr,  # A K-stride (=1 when trans_a=False, contiguous)
     stride_bk: tl.constexpr,  # B K-stride (=1 when trans_b=True)
@@ -204,16 +219,12 @@ def _grouped_gemm_bf16_process_tile(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-    NUM_XCDS: tl.constexpr,
-    CHUNK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
-    ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
+    ALLOW_TF32: tl.constexpr,
 ):
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    
+    """Compute one output tile of the grouped GEMM."""
     # ── Find group via linear scan (O(G)) ──
     group_idx: tl.int32 = 0
     tile_start: tl.int32 = 0
@@ -255,15 +266,13 @@ def _grouped_gemm_bf16_process_tile(
     A_BASE = A + m_start_g * stride_am + rm[:, None] * stride_am + rk[None, :] * stride_ak
     B_BASE = B + group_offset_b + rk[:, None] * stride_bk + rn[None, :] * stride_bn
 
-    # ── K-loop (identical to single GEMM) ──
+    # ── K-loop ──
     loop_k = tl.cdiv(K, BLOCK_SIZE_K)
     if not EVEN_K:
         loop_k -= 1
     tl.assume(loop_k > 1)
 
-    acc_dtype = tl.float32
-
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, loop_k):
         if stride_ak == 1:
             a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_A)
@@ -304,14 +313,16 @@ def _grouped_gemm_bf16_process_tile(
     C_ = C + m_start_g * stride_cm + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
     tl.store(C_, c, c_mask)
 
-
-@triton.jit()
+@triton.heuristics({"EVEN_K": lambda nargs: nargs['K'] % nargs['BLOCK_SIZE_K'] == 0})
+@triton.jit
 def _grouped_bf16_persistent_gemm_kernel(
     # Pointers
     A,  # [M_total, K]
     B,  # [G, ?, ?]  — (K,N) or (N,K) depending on trans_b
     C,  # [M_total, N]
     group_offs_ptr,  # [G+1] int64
+    # Work-stealing counters (unused when WORK_STEAL=False)
+    global_counter_ptr,  # global fallback counter [1]
     # Dimensions
     G,  # number of groups (runtime)
     N,
@@ -336,8 +347,7 @@ def _grouped_bf16_persistent_gemm_kernel(
     EVEN_K: tl.constexpr,
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
-    WORK_STEALING: tl.constexpr = False,
-    global_counter: torch.Tensor = None,
+    WORK_STEALING: tl.constexpr,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
 ):
     """Persistent grouped GEMM kernel (CPU-sync-free).
@@ -345,15 +355,15 @@ def _grouped_bf16_persistent_gemm_kernel(
     One kernel launch processes ALL groups × ALL tiles.
     Each persistent CU computes total_tiles and maps global tile IDs to
     (group, local_tile) on the fly via O(G) linear scan of group_offs.
+
+    When WORK_STEAL=True, uses a hierarchical per-XCD + global-fallback
+    work-stealing scheme instead of a static stride loop, eliminating
+    load imbalance caused by RCCL memory pressure.
     """
     pid = tl.program_id(0)
-    if NUM_XCDS != 1:
-        pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
-
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     # ── Compute total tiles across all groups (O(G) per CU, group_offs cached in L2) ──
-    # Cast int64 group_offs to int32 for tile arithmetic (tile counts fit in int32)
     total_tiles: tl.int32 = 0
     for _g in range(G):
         m_g = (tl.load(group_offs_ptr + _g + 1) - tl.load(group_offs_ptr + _g)).to(tl.int32)
@@ -385,6 +395,7 @@ def _grouped_bf16_persistent_gemm_kernel(
                 stride_bn,
                 stride_cm,
                 stride_cn,
+                num_pid_n,
                 # Constexpr strides (for compiler optimisation)
                 stride_ak,
                 stride_bk,
@@ -401,7 +412,7 @@ def _grouped_bf16_persistent_gemm_kernel(
                 CACHE_MODIFIER_B,
                 ALLOW_TF32,
             )
-            global_tile_id = tl.atomic_add(global_counter, 1, sem="relaxed", scope='gpu')
+            global_tile_id = tl.atomic_add(global_counter_ptr, 1, sem="relaxed", scope='gpu')
     else:
         for global_tile_id in range(pid, total_tiles, NUM_SMS):
             _grouped_gemm_bf16_process_tile(
@@ -420,6 +431,7 @@ def _grouped_bf16_persistent_gemm_kernel(
                 stride_bn,
                 stride_cm,
                 stride_cn,
+                num_pid_n,
                 # Constexpr strides (for compiler optimisation)
                 stride_ak,
                 stride_bk,
@@ -436,6 +448,7 @@ def _grouped_bf16_persistent_gemm_kernel(
                 CACHE_MODIFIER_B,
                 ALLOW_TF32,
             )
+
 
 
 def grouped_gemm_triton_kernel(
@@ -505,6 +518,7 @@ def grouped_gemm_triton_kernel(
         b,
         out,
         group_offs,
+        global_counter,
         G,
         N,
         K,
