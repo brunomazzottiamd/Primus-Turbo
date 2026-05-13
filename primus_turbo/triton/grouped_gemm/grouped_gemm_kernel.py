@@ -404,9 +404,6 @@ def _grouped_bf16_persistent_gemm_kernel(
                 BLOCK_SIZE_N,
                 BLOCK_SIZE_K,
                 GROUP_SIZE_M,
-                NUM_SMS,
-                NUM_XCDS,
-                CHUNK_SIZE,
                 EVEN_K,
                 CACHE_MODIFIER_A,
                 CACHE_MODIFIER_B,
@@ -440,16 +437,11 @@ def _grouped_bf16_persistent_gemm_kernel(
                 BLOCK_SIZE_N,
                 BLOCK_SIZE_K,
                 GROUP_SIZE_M,
-                NUM_SMS,
-                NUM_XCDS,
-                CHUNK_SIZE,
                 EVEN_K,
                 CACHE_MODIFIER_A,
                 CACHE_MODIFIER_B,
                 ALLOW_TF32,
             )
-
-
 
 def grouped_gemm_triton_kernel(
     a: torch.Tensor,
@@ -512,7 +504,6 @@ def grouped_gemm_triton_kernel(
     even_k = K % BLOCK_K == 0
 
     global_counter = torch.zeros((1,), dtype=torch.int32, device=a.device) + num_sms
-
     _grouped_bf16_persistent_gemm_kernel[(num_sms,)](
         a,
         b,
@@ -540,7 +531,6 @@ def grouped_gemm_triton_kernel(
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
         WORK_STEALING=work_stealing,
-        global_counter=global_counter,
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,
