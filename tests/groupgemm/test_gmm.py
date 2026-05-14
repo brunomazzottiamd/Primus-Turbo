@@ -29,3 +29,7 @@ def test_gmm():
     )
 
     torch.testing.assert_close(out_primus_turbo, out_aiter, atol=1e-2, rtol=1e-2)
+
+
+if __name__ == "__main__":
+    test_gmm()
