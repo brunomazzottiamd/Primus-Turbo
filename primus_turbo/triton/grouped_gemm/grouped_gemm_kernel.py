@@ -204,8 +204,16 @@ def _grouped_gemm_bf16_process_tile(
     G,  # number of groups (runtime)
     N,
     K,
+    # Strides
+    stride_am,  # A row stride
+    stride_bg,  # B group stride: b.stride(0)
+    stride_bn,  # B N-stride (within a group)
+    stride_cm,  # C row stride
+    stride_cn,  # C col stride
     num_pid_n,
-    TRANS_RHS: tl.constexpr,
+    # Constexpr strides (for compiler optimisation)
+    stride_ak: tl.constexpr,  # A K-stride (=1 when trans_a=False, contiguous)
+    stride_bk: tl.constexpr,  # B K-stride (=1 when trans_b=True)
     # Tile config
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -253,13 +261,10 @@ def _grouped_gemm_bf16_process_tile(
 
     # Cast group_idx to int64 to prevent overflow in B group offset
     # (group_idx * stride_bg can exceed int32 when B has many groups)
-    group_offset_b = group_idx.to(tl.int64) * K * N
+    group_offset_b = group_idx.to(tl.int64) * stride_bg
 
-    A_BASE = A + m_start_g * K + rm[:, None] * K + rk[None, :]
-    if TRANS_RHS:
-        B_BASE = B + group_offset_b + rk[:, None] + rn[None, :] * K
-    else:
-        B_BASE = B + group_offset_b + rk[:, None] * N + rn[None, :]
+    A_BASE = A + m_start_g * stride_am + rm[:, None] * stride_am + rk[None, :] * stride_ak
+    B_BASE = B + group_offset_b + rk[:, None] * stride_bk + rn[None, :] * stride_bn
 
     # ── K-loop ──
     loop_k = tl.cdiv(K, BLOCK_SIZE_K)
@@ -269,29 +274,29 @@ def _grouped_gemm_bf16_process_tile(
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, loop_k):
-        a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_A)
+        if stride_ak == 1:
+            a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_A)
+        else:
+            a = tl.load(tl.multiple_of(A_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_A)
 
-        if TRANS_RHS:
+        if stride_bk == 1:
             b = tl.load(tl.multiple_of(B_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_B)
         else:
             b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_B)
 
         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
-        A_BASE += BLOCK_SIZE_K
-        if TRANS_RHS:
-            B_BASE += BLOCK_SIZE_K
-        else:
-            B_BASE += BLOCK_SIZE_K * N
+        A_BASE += BLOCK_SIZE_K * stride_ak
+        B_BASE += BLOCK_SIZE_K * stride_bk
 
     if not EVEN_K:
         rk_last = loop_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-        A_LAST = A + m_start_g * K + rm[:, None] * K + rk_last[None, :]
-        if TRANS_RHS:
-            B_LAST = B + group_offset_b + rk_last[:, None] + rn[None, :] * K
+        A_LAST = A + m_start_g * stride_am + rm[:, None] * stride_am + rk_last[None, :] * stride_ak
+        B_LAST = B + group_offset_b + rk_last[:, None] * stride_bk + rn[None, :] * stride_bn
+        if stride_ak == 1:
+            A_LAST = tl.multiple_of(A_LAST, (1, 16))
         else:
-            B_LAST = B + group_offset_b + rk_last[:, None] * N + rn[None, :]
-        A_LAST = tl.multiple_of(A_LAST, (1, 16))
-        if TRANS_RHS:
+            A_LAST = tl.multiple_of(A_LAST, (16, 1))
+        if stride_bk == 1:
             B_LAST = tl.multiple_of(B_LAST, (16, 1))
         else:
             B_LAST = tl.multiple_of(B_LAST, (1, 16))
@@ -305,7 +310,7 @@ def _grouped_gemm_bf16_process_tile(
     rn_s = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     rn_s = tl.max_contiguous(tl.multiple_of(rn_s, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_mask = (rm_s[:, None] < M_g) & (rn_s[None, :] < N)
-    C_ = C + m_start_g * N + rm_s[:, None] * N + rn_s[None, :]
+    C_ = C + m_start_g * stride_cm + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
     tl.store(C_, c, c_mask)
 
 @triton.heuristics({"EVEN_K": lambda nargs: nargs['K'] % nargs['BLOCK_SIZE_K'] == 0})
@@ -322,7 +327,15 @@ def _grouped_bf16_persistent_gemm_kernel(
     G,  # number of groups (runtime)
     N,
     K,
-    TRANS_RHS: tl.constexpr,
+    # Strides
+    stride_am,  # A row stride
+    stride_bg,  # B group stride: b.stride(0)
+    stride_bn,  # B N-stride (within a group)
+    stride_cm,  # C row stride
+    stride_cn,  # C col stride
+    # Constexpr strides (for compiler optimisation)
+    stride_ak: tl.constexpr,  # A K-stride (=1 when trans_a=False, contiguous)
+    stride_bk: tl.constexpr,  # B K-stride (=1 when trans_b=True)
     # Tile config
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -347,10 +360,6 @@ def _grouped_bf16_persistent_gemm_kernel(
     work-stealing scheme instead of a static stride loop, eliminating
     load imbalance caused by RCCL memory pressure.
     """
-    tl.assume(G > 0)
-    tl.assume(N > 0)
-    tl.assume(K > 0)
-
     pid = tl.program_id(0)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
@@ -359,6 +368,13 @@ def _grouped_bf16_persistent_gemm_kernel(
     for _g in range(G):
         m_g = (tl.load(group_offs_ptr + _g + 1) - tl.load(group_offs_ptr + _g)).to(tl.int32)
         total_tiles += tl.cdiv(m_g, BLOCK_SIZE_M) * num_pid_n
+
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
 
     if WORK_STEALING:
         global_tile_id = pid
@@ -373,8 +389,16 @@ def _grouped_bf16_persistent_gemm_kernel(
                 G,
                 N,
                 K,
+                # Strides
+                stride_am,
+                stride_bg,
+                stride_bn,
+                stride_cm,
+                stride_cn,
                 num_pid_n,
-                TRANS_RHS,
+                # Constexpr strides (for compiler optimisation)
+                stride_ak,
+                stride_bk,
                 # Tile config
                 BLOCK_SIZE_M,
                 BLOCK_SIZE_N,
@@ -398,8 +422,16 @@ def _grouped_bf16_persistent_gemm_kernel(
                 G,
                 N,
                 K,
+                # Strides
+                stride_am,
+                stride_bg,
+                stride_bn,
+                stride_cm,
+                stride_cn,
                 num_pid_n,
-                TRANS_RHS,
+                # Constexpr strides (for compiler optimisation)
+                stride_ak,
+                stride_bk,
                 # Tile config
                 BLOCK_SIZE_M,
                 BLOCK_SIZE_N,
@@ -445,11 +477,18 @@ def grouped_gemm_triton_kernel(
 
     if trans_b:
         N, K_b = b.shape[1], b.shape[2]
+        stride_bk = b.stride(2)  # K is the fast dimension (=1 for contiguous)
+        stride_bn = b.stride(1)  # N-stride
     else:
         K_b, N = b.shape[1], b.shape[2]
+        stride_bk = b.stride(1)  # K-stride
+        stride_bn = b.stride(2)  # N is the fast dimension (=1 for contiguous)
 
     assert K_a == K_b, f"K mismatch: a has K={K_a}, b has K={K_b}"
     K = K_a
+
+    stride_bg = b.stride(0)  # Group stride
+    stride_ak = a.stride(1)  # =1 for contiguous a
 
     # Output
     out = torch.empty((M_total, N), device=a.device, dtype=a.dtype)
@@ -474,7 +513,13 @@ def grouped_gemm_triton_kernel(
         G,
         N,
         K,
-        TRANS_RHS=trans_b,
+        a.stride(0),  # stride_am
+        stride_bg,  # B group stride
+        stride_bn,  # B N-stride
+        out.stride(0),  # stride_cm
+        out.stride(1),  # stride_cn
+        stride_ak=stride_ak,
+        stride_bk=stride_bk,
         BLOCK_SIZE_M=BLOCK_M,
         BLOCK_SIZE_N=BLOCK_N,
         BLOCK_SIZE_K=BLOCK_K,
