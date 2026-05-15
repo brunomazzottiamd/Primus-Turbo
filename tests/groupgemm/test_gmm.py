@@ -3,6 +3,8 @@ import torch
 from primus_turbo.pytorch.ops import grouped_gemm as primus_turbo_gmm
 from aiter.ops.triton.gmm import gmm as aiter_gmm
 
+DEFAULT_GRID_DIM = 256
+
 
 def gen_tensors():
     device = "cuda"
@@ -26,7 +28,7 @@ def gen_tensors():
     return lhs, rhs, group_sizes, group_offs
 
 
-def run_primus_turbo(lhs, rhs, group_sizes, group_offs, grid_dim=240):
+def run_primus_turbo(lhs, rhs, group_sizes, group_offs, grid_dim=DEFAULT_GRID_DIM):
     return primus_turbo_gmm(
         lhs,
         rhs,
@@ -38,18 +40,23 @@ def run_primus_turbo(lhs, rhs, group_sizes, group_offs, grid_dim=240):
     )
 
 
-def run_aiter(lhs, rhs, group_sizes):
+def run_aiter(lhs, rhs, group_sizes, grid_dim=DEFAULT_GRID_DIM):
     # TODO: update AITER to accept int64 group_sizes.
-    # TODO: update AITER to accept grid_dim as optional input argument.
     return aiter_gmm(
-        lhs, rhs, group_sizes.to(torch.int32), preferred_element_type=lhs.dtype
+        lhs,
+        rhs,
+        group_sizes.to(torch.int32),
+        preferred_element_type=lhs.dtype,
+        grid_dim=grid_dim,
     )
 
 
-def test_gmm():
+def test_gmm(grid_dim=DEFAULT_GRID_DIM):
     lhs, rhs, group_sizes, group_offs = gen_tensors()
-    out_primus_turbo = run_primus_turbo(lhs, rhs, group_sizes, group_offs)
-    out_aiter = run_aiter(lhs, rhs, group_sizes)
+    out_primus_turbo = run_primus_turbo(
+        lhs, rhs, group_sizes, group_offs, grid_dim=grid_dim
+    )
+    out_aiter = run_aiter(lhs, rhs, group_sizes, grid_dim=grid_dim)
     torch.testing.assert_close(out_primus_turbo, out_aiter, atol=1e-3, rtol=1e-3)
 
 
@@ -75,16 +82,16 @@ def bench(fn, warmup=5, iters=20):
     return min_time, avg_time, max_time
 
 
-def bench_gmm():
+def bench_gmm(grid_dim=DEFAULT_GRID_DIM):
     lhs, rhs, group_sizes, group_offs = gen_tensors()
 
     def primus_turbo_fn():
-        return run_primus_turbo(lhs, rhs, group_sizes, group_offs)
+        return run_primus_turbo(lhs, rhs, group_sizes, group_offs, grid_dim=grid_dim)
 
     min_pt, avg_pt, max_pt = bench(primus_turbo_fn)
 
     def aiter_fn():
-        return run_aiter(lhs, rhs, group_sizes)
+        return run_aiter(lhs, rhs, group_sizes, grid_dim=grid_dim)
 
     min_a, avg_a, max_a = bench(aiter_fn)
 
@@ -93,7 +100,9 @@ def bench_gmm():
 
 
 if __name__ == "__main__":
+    # TODO: add CLI parser that accepts --grid-dim and --work-stealing
+    grid_dim = 240
     print("Testing...")
-    test_gmm()
+    test_gmm(grid_dim=grid_dim)
     print("Benchmarking...")
-    bench_gmm()
+    bench_gmm(grid_dim=grid_dim)
