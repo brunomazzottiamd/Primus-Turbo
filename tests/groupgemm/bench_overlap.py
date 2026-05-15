@@ -25,6 +25,8 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.gmm import gmm as aiter_gmm
+
 
 # ---------------------------------------------------------------------------
 # Triton JIT helpers (inlined from AITER pid_preprocessing.py)
@@ -176,8 +178,19 @@ def run_grouped_gemm_primus(lhs, rhs, group_lens, out, M, K, N, G, num_cu, _num_
     return pt_grouped_gemm(lhs, rhs, group_lens, trans_b=_primus_trans_b, num_cu=num_cu, work_stealing=_primus_work_stealing)
 
 
+def run_grouped_gemm_aiter(lhs, rhs, group_sizes, out, M, K, N, G, grid_dim, _num_xcds):
+    # TODO: update AITER to accept int64 group_sizes.
+    return aiter_gmm(
+        lhs,
+        rhs,
+        group_sizes.to(torch.int32),
+        preferred_element_type=lhs.dtype,
+        grid_dim=grid_dim,
+    )
+
+
 # Default — overridden by main() based on --backend
-run_grouped_gemm = run_grouped_gemm_triton
+run_grouped_gemm = run_grouped_gemm_primus
 
 
 # ---------------------------------------------------------------------------
@@ -394,9 +407,9 @@ def main():
                         help="Enable PyTorch profiler trace export")
     parser.add_argument("--num-ag", type=int, default=1,
                         help="Number of concurrent all-gathers to launch during overlap")
-    parser.add_argument("--backend", type=str, default="triton",
-                        choices=["triton", "primus"],
-                        help="Grouped GEMM backend: 'triton' (built-in) or 'primus' (Primus-Turbo CK)")
+    parser.add_argument("--backend", type=str, default="primus",
+                        choices=["triton", "primus", "aiter"],
+                        help="Grouped GEMM backend: 'triton' (built-in), 'primus' (Primus-Turbo Triton) or 'aiter' (AITER Triton)")
     parser.add_argument("--trans-b", action="store_true",
                         help="Use transposed weight layout [G, N, K] (Primus backend only)")
     parser.add_argument("--work-stealing", action="store_true",
@@ -418,8 +431,11 @@ def main():
         assert K % 64 == 0, f"K={K} must be divisible by 64"
         assert not args.trans_b, "--trans-b is only supported with --backend primus"
         run_grouped_gemm = run_grouped_gemm_triton
-    else:
+    elif backend == "primus":
         run_grouped_gemm = run_grouped_gemm_primus
+    else:
+        assert backend == "aiter"
+        run_grouped_gemm = run_grouped_gemm_aiter
 
     nccl_max_nchannels = os.environ.get("NCCL_MAX_NCHANNELS", "")
 
