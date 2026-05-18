@@ -179,11 +179,10 @@ def run_grouped_gemm_primus(lhs, rhs, group_lens, out, M, K, N, G, num_cu, _num_
 
 
 def run_grouped_gemm_aiter(lhs, rhs, group_sizes, out, M, K, N, G, grid_dim, _num_xcds):
-    # TODO: update AITER to accept int64 group_sizes.
     return aiter_gmm(
         lhs,
         rhs,
-        group_sizes.to(torch.int32),
+        group_sizes,
         preferred_element_type=lhs.dtype,
         grid_dim=grid_dim,
     )

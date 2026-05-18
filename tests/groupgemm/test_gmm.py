@@ -41,11 +41,10 @@ def run_primus_turbo(lhs, rhs, group_sizes, group_offs, grid_dim=DEFAULT_GRID_DI
 
 
 def run_aiter(lhs, rhs, group_sizes, grid_dim=DEFAULT_GRID_DIM):
-    # TODO: update AITER to accept int64 group_sizes.
     return aiter_gmm(
         lhs,
         rhs,
-        group_sizes.to(torch.int32),
+        group_sizes,
         preferred_element_type=lhs.dtype,
         grid_dim=grid_dim,
     )
