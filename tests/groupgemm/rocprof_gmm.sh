@@ -21,7 +21,8 @@ df = pd.read_csv(
 )
 # Filter by kernel name.
 df = df[
-    (df["Kernel_Name"] == "_grouped_bf16_persistent_gemm_kernel")
+    (df["Kernel_Name"] == "compute_group_offs_device")
+    | (df["Kernel_Name"] == "_grouped_bf16_persistent_gemm_kernel")
     | (df["Kernel_Name"] == "gmm_kernel")
 ]
 # Keep only the last 20 samples per kernel. Other samples are test and warmup runs.
@@ -32,7 +33,11 @@ df["Time_ms"] = (df["End_Timestamp"] - df["Start_Timestamp"]) * 1e-6
 df = df[["Kernel_Name", "Time_ms"]]
 # Rename kernels.
 df["Kernel_Name"] = df["Kernel_Name"].replace(
-    {"_grouped_bf16_persistent_gemm_kernel": "Primus-Turbo", "gmm_kernel": "AITER"}
+    {
+        "compute_group_offs_device": "Primus-Turbo (group offs)",
+        "_grouped_bf16_persistent_gemm_kernel": "Primus-Turbo (main kernel)",
+        "gmm_kernel": "AITER",
+    }
 )
 # Compute statistics per kernel.
 stats = (
