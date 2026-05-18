@@ -21,19 +21,19 @@ def gen_tensors():
     gs_list = [M // G] * G
     gs_list[-1] += M % G
     group_sizes = torch.tensor(gs_list, dtype=gs_dtype, device=device)
-    group_offs = torch.ops.primus_turbo_cpp_extension.grouped_gemm_compute_offs(
-        group_sizes
+
+    return (
+        lhs,
+        rhs,
+        group_sizes,
     )
 
-    return lhs, rhs, group_sizes, group_offs
 
-
-def run_primus_turbo(lhs, rhs, group_sizes, group_offs, grid_dim=DEFAULT_GRID_DIM):
+def run_primus_turbo(lhs, rhs, group_sizes, grid_dim=DEFAULT_GRID_DIM):
     return primus_turbo_gmm(
         lhs,
         rhs,
         group_sizes,
-        group_offs=group_offs,
         trans_b=True,
         num_cu=grid_dim,
         work_stealing=True,
@@ -51,10 +51,8 @@ def run_aiter(lhs, rhs, group_sizes, grid_dim=DEFAULT_GRID_DIM):
 
 
 def test_gmm(grid_dim=DEFAULT_GRID_DIM):
-    lhs, rhs, group_sizes, group_offs = gen_tensors()
-    out_primus_turbo = run_primus_turbo(
-        lhs, rhs, group_sizes, group_offs, grid_dim=grid_dim
-    )
+    lhs, rhs, group_sizes = gen_tensors()
+    out_primus_turbo = run_primus_turbo(lhs, rhs, group_sizes, grid_dim=grid_dim)
     out_aiter = run_aiter(lhs, rhs, group_sizes, grid_dim=grid_dim)
     torch.testing.assert_close(out_primus_turbo, out_aiter, atol=1e-3, rtol=1e-3)
 
@@ -82,10 +80,10 @@ def bench(fn, warmup=5, iters=20):
 
 
 def bench_gmm(grid_dim=DEFAULT_GRID_DIM):
-    lhs, rhs, group_sizes, group_offs = gen_tensors()
+    lhs, rhs, group_sizes = gen_tensors()
 
     def primus_turbo_fn():
-        return run_primus_turbo(lhs, rhs, group_sizes, group_offs, grid_dim=grid_dim)
+        return run_primus_turbo(lhs, rhs, group_sizes, grid_dim=grid_dim)
 
     min_pt, avg_pt, max_pt = bench(primus_turbo_fn)
 
