@@ -185,6 +185,7 @@ def run_grouped_gemm_aiter(lhs, rhs, group_sizes, out, M, K, N, G, grid_dim, _nu
         group_sizes,
         preferred_element_type=lhs.dtype,
         grid_dim=grid_dim,
+        work_stealing=_primus_work_stealing,
     )
 
 
@@ -412,7 +413,7 @@ def main():
     parser.add_argument("--trans-b", action="store_true",
                         help="Use transposed weight layout [G, N, K] (Primus backend only)")
     parser.add_argument("--work-stealing", action="store_true",
-                        help="Enable work-stealing tile scheduler (Primus backend only)")
+                        help="Enable work-stealing tile scheduler (Primus and AITER backend only)")
     args = parser.parse_args()
 
     local_rank, world_size, rank = setup_distributed()

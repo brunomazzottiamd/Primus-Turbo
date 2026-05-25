@@ -1,9 +1,9 @@
+import argparse
+
 import torch
 
 from primus_turbo.pytorch.ops import grouped_gemm as primus_turbo_gmm
 from aiter.ops.triton.gmm import gmm as aiter_gmm
-
-DEFAULT_GRID_DIM = 256
 
 
 def gen_tensors():
@@ -29,31 +29,32 @@ def gen_tensors():
     )
 
 
-def run_primus_turbo(lhs, rhs, group_sizes, grid_dim=DEFAULT_GRID_DIM):
+def run_primus_turbo(lhs, rhs, group_sizes, grid_dim, work_stealing):
     return primus_turbo_gmm(
         lhs,
         rhs,
         group_sizes,
         trans_b=True,
         num_cu=grid_dim,
-        work_stealing=True,
+        work_stealing=work_stealing,
     )
 
 
-def run_aiter(lhs, rhs, group_sizes, grid_dim=DEFAULT_GRID_DIM):
+def run_aiter(lhs, rhs, group_sizes, grid_dim, work_stealing):
     return aiter_gmm(
         lhs,
         rhs,
         group_sizes,
         preferred_element_type=lhs.dtype,
         grid_dim=grid_dim,
+        work_stealing=work_stealing,
     )
 
 
-def test_gmm(grid_dim=DEFAULT_GRID_DIM):
+def test_gmm(grid_dim, work_stealing):
     lhs, rhs, group_sizes = gen_tensors()
-    out_primus_turbo = run_primus_turbo(lhs, rhs, group_sizes, grid_dim=grid_dim)
-    out_aiter = run_aiter(lhs, rhs, group_sizes, grid_dim=grid_dim)
+    out_primus_turbo = run_primus_turbo(lhs, rhs, group_sizes, grid_dim, work_stealing)
+    out_aiter = run_aiter(lhs, rhs, group_sizes, grid_dim, work_stealing)
     torch.testing.assert_close(out_primus_turbo, out_aiter, atol=1e-3, rtol=1e-3)
 
 
@@ -79,16 +80,16 @@ def bench(fn, warmup=5, iters=20):
     return min_time, avg_time, max_time
 
 
-def bench_gmm(grid_dim=DEFAULT_GRID_DIM):
+def bench_gmm(grid_dim, work_stealing):
     lhs, rhs, group_sizes = gen_tensors()
 
     def primus_turbo_fn():
-        return run_primus_turbo(lhs, rhs, group_sizes, grid_dim=grid_dim)
+        return run_primus_turbo(lhs, rhs, group_sizes, grid_dim, work_stealing)
 
     min_pt, avg_pt, max_pt = bench(primus_turbo_fn)
 
     def aiter_fn():
-        return run_aiter(lhs, rhs, group_sizes, grid_dim=grid_dim)
+        return run_aiter(lhs, rhs, group_sizes, grid_dim, work_stealing)
 
     min_a, avg_a, max_a = bench(aiter_fn)
 
@@ -97,9 +98,19 @@ def bench_gmm(grid_dim=DEFAULT_GRID_DIM):
 
 
 if __name__ == "__main__":
-    # TODO: add CLI parser that accepts --grid-dim and --work-stealing
-    grid_dim = 240
+    parser = argparse.ArgumentParser(description="test and benchmark grouped GEMM")
+    parser.add_argument(
+        "--grid-dim",
+        type=int,
+        default=256,
+    )
+    parser.add_argument(
+        "--work-stealing",
+        action="store_true",
+    )
+    args = parser.parse_args()
+    print(f"Setup: grid_dim={args.grid_dim}, work_stealing={args.work_stealing}")
     print("Testing...")
-    test_gmm(grid_dim=grid_dim)
+    test_gmm(args.grid_dim, args.work_stealing)
     print("Benchmarking...")
-    bench_gmm(grid_dim=grid_dim)
+    bench_gmm(args.grid_dim, args.work_stealing)
