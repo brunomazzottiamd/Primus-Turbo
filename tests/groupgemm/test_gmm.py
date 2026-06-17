@@ -40,7 +40,7 @@ def run_primus_turbo(lhs, rhs, group_sizes, grid_dim, work_stealing):
     )
 
 
-def run_aiter(lhs, rhs, group_sizes, grid_dim, work_stealing):
+def run_aiter(lhs, rhs, group_sizes, grid_dim, work_stealing, work_stealing_mode):
     return aiter_gmm(
         lhs,
         rhs,
@@ -48,13 +48,16 @@ def run_aiter(lhs, rhs, group_sizes, grid_dim, work_stealing):
         preferred_element_type=lhs.dtype,
         grid_dim=grid_dim,
         work_stealing=work_stealing,
+        work_stealing_mode=work_stealing_mode,
     )
 
 
-def test_gmm(grid_dim, work_stealing):
+def test_gmm(grid_dim, work_stealing, work_stealing_mode):
     lhs, rhs, group_sizes = gen_tensors()
     out_primus_turbo = run_primus_turbo(lhs, rhs, group_sizes, grid_dim, work_stealing)
-    out_aiter = run_aiter(lhs, rhs, group_sizes, grid_dim, work_stealing)
+    out_aiter = run_aiter(
+        lhs, rhs, group_sizes, grid_dim, work_stealing, work_stealing_mode
+    )
     torch.testing.assert_close(out_primus_turbo, out_aiter, atol=1e-3, rtol=1e-3)
 
 
@@ -80,7 +83,7 @@ def bench(fn, warmup=5, iters=20):
     return min_time, avg_time, max_time
 
 
-def bench_gmm(grid_dim, work_stealing):
+def bench_gmm(grid_dim, work_stealing, work_stealing_mode):
     lhs, rhs, group_sizes = gen_tensors()
 
     def primus_turbo_fn():
@@ -89,7 +92,9 @@ def bench_gmm(grid_dim, work_stealing):
     min_pt, avg_pt, max_pt = bench(primus_turbo_fn)
 
     def aiter_fn():
-        return run_aiter(lhs, rhs, group_sizes, grid_dim, work_stealing)
+        return run_aiter(
+            lhs, rhs, group_sizes, grid_dim, work_stealing, work_stealing_mode
+        )
 
     min_a, avg_a, max_a = bench(aiter_fn)
 
@@ -108,9 +113,17 @@ if __name__ == "__main__":
         "--work-stealing",
         action="store_true",
     )
+    parser.add_argument(
+        "--work-stealing-mode",
+        type=str.lower,
+        choices=("global", "per_xcd"),
+        default="global",
+    )
     args = parser.parse_args()
-    print(f"Setup: grid_dim={args.grid_dim}, work_stealing={args.work_stealing}")
+    print(
+        f"Setup: grid_dim={args.grid_dim}, work_stealing={args.work_stealing}, work_stealing_mode={args.work_stealing_mode}"
+    )
     print("Testing...")
-    test_gmm(args.grid_dim, args.work_stealing)
+    test_gmm(args.grid_dim, args.work_stealing, args.work_stealing_mode)
     print("Benchmarking...")
-    bench_gmm(args.grid_dim, args.work_stealing)
+    bench_gmm(args.grid_dim, args.work_stealing, args.work_stealing_mode)

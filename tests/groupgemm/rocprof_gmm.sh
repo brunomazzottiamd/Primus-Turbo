@@ -21,9 +21,9 @@ df = pd.read_csv(
 )
 # Filter by kernel name.
 df = df[
-    (df["Kernel_Name"] == "compute_group_offs_device")
-    | (df["Kernel_Name"] == "_grouped_bf16_persistent_gemm_kernel")
-    | (df["Kernel_Name"] == "gmm_kernel")
+    (df["Kernel_Name"] == "compute_group_offs_device")  # Primus-Turbo
+    | (df["Kernel_Name"] == "_grouped_bf16_persistent_gemm_kernel")  # Primus-Turbo
+    | (df["Kernel_Name"].str.startswith("gmm_kernel_"))  # AITER
 ]
 # Keep only the last 20 samples per kernel. Other samples are test and warmup runs.
 df = df.groupby("Kernel_Name", as_index=False).tail(20)
@@ -36,9 +36,9 @@ df["Kernel_Name"] = df["Kernel_Name"].replace(
     {
         "compute_group_offs_device": "Primus-Turbo (group offs)",
         "_grouped_bf16_persistent_gemm_kernel": "Primus-Turbo (main kernel)",
-        "gmm_kernel": "AITER",
     }
 )
+df.loc[df["Kernel_Name"].str.startswith("gmm_kernel_"), "Kernel_Name"] = "AITER"
 # Compute statistics per kernel.
 stats = (
     df.groupby("Kernel_Name")["Time_ms"]
